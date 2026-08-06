@@ -104,3 +104,21 @@ Each entry is the smallest change that teaches one new idea. Read the diff betwe
 - The greeting handler and `last topic?` command work in both modes without special-casing. They run *after* the unified command branch, so the loop has one body, not two.
 
 **Next up (6.0):** token usage printed after each turn so the cost of persistence becomes visible.
+
+## chatbot5.2.py — tighter mode-switch wording
+
+**Changed:** the `"voice"` and `"text"` / `"voice off"` branches in the loop.
+
+**Why:** the wording in 5.1 was redundant. `"Voice mode is already on."` for a one-word command is fine but verbose; the bot's persona is "friendly and concise" and the messages should match. Also, `"text off"` and `"voice off"` were duplicating each other — if voice is off, you're already in text mode, so a single command handles both.
+
+**Diff vs 5.1:**
+- `voice` already on → "Already in voice mode." (was: "Voice mode is already on.")
+- `text` / `voice off` already on text → "Already in text mode." (was: separate messages per branch)
+- Removed `text off` command entirely. `voice off` covers both directions.
+- Startup banner lists only the commands that actually exist.
+
+**No code logic changed.** Same `input_mode` global, same `read_input()` helper, same loop body. This is a copy of 5.1 with tighter copy and a smaller command surface.
+
+**Try it:** `python3 chatbot5.2.py` — same flow as 5.1, shorter mode messages.
+
+**Next up (6.0):** token usage printed after each turn so the cost of persistence becomes visible.
