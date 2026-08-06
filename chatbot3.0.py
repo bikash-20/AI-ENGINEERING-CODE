@@ -47,7 +47,6 @@ while True:
     )
 
     reply = ""
-    tts_buffer = ""
     print("Bot: ", end="", flush=True)
 
     for chunk in stream:
@@ -59,16 +58,10 @@ while True:
         reply += piece
         print(piece, end="", flush=True)
 
-        # feed TTS in sentence-sized chunks so it doesn't restart on every token
-        tts_buffer += piece
-        if piece.endswith((".", "!", "?", "\n")):
-            speak(tts_buffer)
-            tts_buffer = ""
-
-    # flush whatever's left after the stream ends
-    if tts_buffer.strip():
-        speak(tts_buffer)
-
     print("\n")
+
+    # speak the full reply after the stream is done
+    # speaking inside the loop races with the iterator and can drop chunks
+    speak(reply)
 
     messages.append({"role": "assistant", "content": reply})
