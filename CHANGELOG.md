@@ -81,3 +81,26 @@ Each entry is the smallest change that teaches one new idea. Read the diff betwe
 - The greeting matcher uses `strip()` and a small set. Add `"good morning"` later if you want; the loop is now a small command dispatcher instead of a one-track chat.
 
 **Next up (6.0):** token usage (`usage.prompt_tokens` / `completion_tokens`) printed after each turn so the cost of persistence becomes visible.
+
+## chatbot5.1.py — sticky input mode
+
+**Added:** a single `input_mode` variable (`"text"` or `"voice"`) that survives between turns.
+
+**Why:** in 5.0, typing `voice` worked for *one* turn. Next turn you had to type `voice` again. The user expected a *mode*, not a *command*. A real chat client has a stable input mode you switch into and out of — same idea here.
+
+**Changed:**
+- `chatbot5.1.py`: new `input_mode` global plus `read_input()` helper that picks the right read path each turn. The loop body is otherwise identical to 5.0 — the same command parser, the same streaming, the same TTS-after.
+- New commands: `voice`, `text`, `voice off`, `text off`. The `* off` form is symmetric: if the mode is already off, you get a friendly "already off" message instead of a silent mode change.
+
+**Try it:**
+- `python3 chatbot5.1.py`
+- Type `voice` → says "Switched to voice mode". Next prompt is `[type a command, or Enter to speak]:`. Press Enter, speak, bot replies. Press Enter, speak, bot replies. No more typing `voice` every turn.
+- Type `text` → switches back without ending the session.
+- In voice mode, type `last topic?` at the prompt — it's a command, recognized the same way as text mode.
+
+**Things you'll notice (intentional lessons):**
+- Voice mode still asks for a typed line every turn so you can issue commands. The alternative — voice-only command recognition — would need its own recognition layer. Out of scope here.
+- `input_mode` is *not* persisted across runs. Quitting and restarting drops you back to text. That's deliberate: a forgotten mode is worse than a default mode.
+- The greeting handler and `last topic?` command work in both modes without special-casing. They run *after* the unified command branch, so the loop has one body, not two.
+
+**Next up (6.0):** token usage printed after each turn so the cost of persistence becomes visible.
