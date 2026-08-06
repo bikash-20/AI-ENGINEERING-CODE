@@ -57,3 +57,27 @@ Each entry is the smallest change that teaches one new idea. Read the diff betwe
 - `save_history` writes the *entire* list every turn, not an append. Fine for a chat file, but it's why you don't want to do this for a million-user product.
 
 **Next up (5.0):** show `usage.prompt_tokens` / `completion_tokens` after each turn so you can watch the cost shape a long conversation.
+
+## chatbot5.0.py — commands + local greeting
+
+**Added:** two shortcuts in the loop, no model call needed for either.
+
+- **`last topic?`** — reads `chat_history.json`, finds the last `user` turn, and asks the model to compress it into ≤ 8 words. Returns the line. Done with a tiny one-shot prompt so the main history is untouched.
+- **Greetings (`hey`, `hi`, `hello`, `yo`, `sup`, `hola`, `howdy`)** — handled locally. Bot replies with a fixed open question and nothing gets appended to `messages`.
+
+**Why:** a real chatbot shouldn't have to call the model for every trivial turn. Greetings are noise — saving them to history means the model will eventually "remember" that you said hey 200 times. Commands like `last topic?` are a different shape: they're not conversation, they're a *query against history*. Treating them as a separate code path keeps the main chat history clean.
+
+**Changed:**
+- `chatbot5.0.py`: new `GREETINGS` set, `GREETING_REPLY` constant, and `last_topic()` helper. Loop checks the raw input *before* appending to `messages`.
+
+**Try it:**
+- Run, say `hey` — bot responds locally, no API call, history unchanged.
+- Run, type `last topic?` after some conversation — bot replies with a one-liner about what you last asked.
+- `cat chat_history.json` — neither the greeting nor the `last topic?` query is in there. Only real conversation turns.
+
+**Things you'll notice (intentional lessons):**
+- A greeting being "free" means the bot feels faster on common inputs. Same trick product bots use for "thanks", "ok", emoji-only replies.
+- `last_topic()` uses a *separate* prompt array, not the main `messages`. The summary never enters the conversation. If you wanted it to, you'd append it as a fake user turn — that's a design choice, not a bug.
+- The greeting matcher uses `strip()` and a small set. Add `"good morning"` later if you want; the loop is now a small command dispatcher instead of a one-track chat.
+
+**Next up (6.0):** token usage (`usage.prompt_tokens` / `completion_tokens`) printed after each turn so the cost of persistence becomes visible.
