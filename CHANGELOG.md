@@ -122,3 +122,19 @@ Each entry is the smallest change that teaches one new idea. Read the diff betwe
 **Try it:** `python3 chatbot5.2.py` — same flow as 5.1, shorter mode messages.
 
 **Next up (6.0):** token usage printed after each turn so the cost of persistence becomes visible.
+
+## Patch — mic calibration in `voice_utils.listen()`
+
+**This is a fix, not a feature.** I am not bumping a version number.
+
+**Symptom:** in voice mode, the bot heard the user fine on the first turn. On subsequent turns it bailed out early — felt like the bot was "rushing" instead of waiting for the user to finish.
+
+**Suspected cause:** the bot's TTS (via `pyttsx3` → macOS `say`) plays through the same speakers the mic is sitting next to. The mic is opened again immediately after `speak()` returns, but the speaker audio is still ringing. `speech_recognition` then auto-tunes `energy_threshold` against that ringing audio as the ambient baseline, so the user's real voice has to exceed a threshold that's already "loud" — it bails on partial phrases.
+
+**Change:** added `recognizer.adjust_for_ambient_noise(source, duration=0.5)` inside `listen()` between opening the mic stream and calling `recognizer.listen()`. This forces a deliberate half-second ambient sample at a known-quiet moment.
+
+**Risk:** I'm guessing. Possible real cause is something else (`pyttsx3` blocking the audio device, `recognize_google` rate limit, OS buffer reuse). If this doesn't fix it, revert the `voice_utils.py` patch — it's one block, fully isolated.
+
+**Revert:** delete the `Calibrating mic...` line and the `_recognizer.adjust_for_ambient_noise(...)` call inside `listen()`.
+
+**Next up (6.0):** token usage printed after each turn so the cost of persistence becomes visible.

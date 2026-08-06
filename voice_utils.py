@@ -21,6 +21,12 @@ def listen():
         _sr = sr
         _recognizer = sr.Recognizer()
     with _sr.Microphone() as source:
+        # sample the room for half a second before listening
+        # the bot just finished speaking through the same speakers,
+        # so the mic hears ringing audio as the baseline.
+        # this calibrates against the actual quiet room.
+        print("Calibrating mic...")
+        _recognizer.adjust_for_ambient_noise(source, duration=0.5)
         print("Listening...")
         audio = _recognizer.listen(source)
     try:
