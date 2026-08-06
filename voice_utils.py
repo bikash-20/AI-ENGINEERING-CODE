@@ -1,4 +1,5 @@
 _recognizer = None
+_sr = None
 _tts_engine = None
 
 
@@ -14,15 +15,16 @@ def speak(text):
 
 def listen():
     """Listen from the microphone and convert speech to text."""
-    global _recognizer
+    global _recognizer, _sr
     if _recognizer is None:
         import speech_recognition as sr
+        _sr = sr
         _recognizer = sr.Recognizer()
-    with _recognizer.Microphone() as source:
+    with _sr.Microphone() as source:
         print("Listening...")
         audio = _recognizer.listen(source)
     try:
         return _recognizer.recognize_google(audio)
-    except _recognizer.UnknownValueError:
+    except _sr.UnknownValueError:
         return ""
     
