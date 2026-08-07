@@ -138,3 +138,53 @@ Each entry is the smallest change that teaches one new idea. Read the diff betwe
 **Revert:** delete the `Calibrating mic...` line and the `_recognizer.adjust_for_ambient_noise(...)` call inside `listen()`.
 
 **Next up (6.0):** token usage printed after each turn so the cost of persistence becomes visible.
+
+## chatbot5.2.py — rewrite, not a patch: online/offline + local Ollama + hybrid STT
+
+**This is a behavior change, not a copy of 5.2 with tweaked wording.** The version number stays at 5.2 because the user-facing commands (`voice`, `text`, `last topic?`, `exit`) and the `chat_history.json` shape are unchanged. Everything below is additive.
+
+**Added — connectivity:**
+- `voice_utils.has_internet()` — single socket probe to `8.8.8.8:53` with a ~2s timeout, result cached at module level. Cached so we don't pay the latency on every `listen()` call.
+- `mark_offline()` / `mark_online()` — explicit state flips so the chatbot can update the cache when it observes a real network failure or a successful local call. The cache is the source of truth for both the model router and the STT router.
+
+**Added — second client (Ollama):**
+- New `OpenAI(api_key="ollama", base_url="http://localhost:11434/v1")` instance alongside the existing OpenRouter one. Both speak the OpenAI chat-completions API, so the rest of the script is agnostic about which one is active.
+- `MODELS` registry — a dict of `(label, client, model_id, requires_internet)` tuples for the four models: `deepseek` (OpenRouter, online-only), `qwen` / `gemma` / `phi` (Ollama, local). The `requires_internet` flag is what auto-failover uses to decide whether to swap models on an error.
+
+**Added — model selection:**
+- `active_key` / `active_client` / `active_model_id` globals, mutated by `set_active(key)`.
+- `pick_initial_model()` — boots `deepseek` if online, first local model if not. Single source of truth used at startup and inside the failover path.
+- New commands: `model` (print active) and `model deepseek` / `model qwen` / `model gemma` / `model phi` (switch). Switching to a cloud model while offline prints a heads-up; the next API call will either succeed (and flip the cache to online) or fail over to a local model. Works regardless of online/offline state — overrides everything.
+
+**Changed — calls routed through one helper:**
+- All API calls — the main streaming chat loop *and* `last_topic()` — now go through `_call_with_failover(messages, stream)`. It calls the active client, catches any exception, flips `mark_offline()`, and if the active model was online-only, swaps to `pick_initial_model()` and retries once. This is what fixes `last_topic()` offline (it was hardcoded to `deepseek/deepseek-chat` and would have broken the moment you lost internet).
+
+**Changed — streaming loop is now resilient:**
+- The `for chunk in stream:` block is wrapped in `try/except`. A mid-stream network drop prints `(stream interrupted: ...)` instead of crashing. If no tokens arrived, the user turn that was just appended to `messages` is popped and re-saved, so `chat_history.json` stays consistent.
+- `mark_online()` runs after every successful reply, so the cache self-corrects when connectivity returns.
+
+**Changed — hybrid STT in `voice_utils.listen()`:**
+- Capture step (`speech_recognition.Microphone()` + `adjust_for_ambient_noise`) is shared between both paths and unchanged in behavior.
+- Online: `recognizer.recognize_google(audio)` — same as before. If Google raises anything other than `UnknownValueError` (no internet mid-call, quota, DNS), it prints a one-liner, calls `mark_offline()`, and falls through to the local whisper attempt instead of crashing.
+- Offline: serializes the captured audio to WAV in-memory and `POST`s it as multipart form data with field name `audio` to `http://localhost:5005/transcribe`. Reads `data["text"]`.
+- Both paths return `""` on failure with a clear one-line message about which path failed and why. No exceptions propagate to the chatbot loop.
+- `speak()` is unchanged — `pyttsx3` is already fully offline. The optional Piper TTS server on port 5006 is not wired up (deferred — `pyttsx3` is good enough for now).
+
+**Why this isn't a 6.0:**
+The user's perspective didn't change. Same commands, same `chat_history.json`, same `voice` / `text` toggle pattern. The connectivity-aware backend and the model switcher are infrastructure that the loop *uses*, not new commands the user has to learn *except* for the explicit `model X` ones. The "smallest change that teaches one new idea" rule is broken here on purpose — half a dozen small ideas (caching, failover, model registry, hybrid STT, mid-stream resilience) are all in one file because they share the same state.
+
+**Try it:**
+- `python3 chatbot5.2.py` — boots online, deepseek active.
+- `model phi` — switches immediately to local phi4-mini. Status line prints `[online | phi4-mini (Ollama, local)]`.
+- Disconnect wifi, type something. The first call will either succeed (if you were already on a local model) or print `(network error: ... Switched to qwen2.5-coder:7b (Ollama, local).)` and retry.
+- `voice` mode offline: `listen()` will skip Google and go straight to `localhost:5005/transcribe`. If the whisper server isn't running, you'll see `(Local whisper STT failed: ...)` and the prompt returns — no crash.
+- `model deepseek` while offline — prints a note, then attempts the call. If internet is actually back, the cache flips to online and the call succeeds. If not, it fails over to a local model again.
+- `cat chat_history.json` — same shape as before. Model switches never touch it.
+
+**Things you'll notice (intentional lessons):**
+- The connectivity cache is *both* updated by the explicit probe (`has_internet()`) *and* by observed runtime results. Pure probes would lie when the cloud is reachable but the cloud provider is down. Pure observation would lie before the first call. Doing both is the smallest change that handles both cases.
+- `_call_with_failover` only retries once. A second failure bubbles up — the chatbot prints `(API error: ...)` and pops the user turn so the history doesn't drift. A retry loop would feel magical in the best case and silently swallow real bugs in the worst case.
+- `model` switching is decoupled from `input_mode` switching on purpose. Voice/text is a *transport* choice; model is a *backend* choice. Mixing them into one command would couple two things that change for different reasons.
+- `chat_history.json` stays model-agnostic. Switching models mid-conversation just means the next call sends the same list to a different client. The model sees whatever the previous model wrote, including its own quirks. That's a feature for "compare two models on the same context" — not a bug to fix.
+
+**Next up (6.0):** token usage printed after each turn so the cost of persistence becomes visible. Same as before — this entry doesn't deliver it.
