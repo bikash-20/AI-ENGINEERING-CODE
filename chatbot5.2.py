@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 
 from voice_utils import speak, listen, has_internet, mark_offline, mark_online
 
+import rag
+
 load_dotenv()
 
 # ----------------------------------------------------------------------
@@ -32,6 +34,21 @@ OLLAMA_CLIENT = OpenAI(
     api_key="ollama",
     base_url="http://localhost:11434/v1",
 )
+
+# Wire the OpenRouter client into rag.py for the embedding tier.
+# (In commit 2, this is where the cascade layer will register multiple
+# embedding clients and switch between them.)
+#
+# TODO(commit 2): the `ask` and `ingest` commands below are cloud-only
+# right now. If `has_internet()` is False, rag.build_augmented_messages
+# still calls OPENROUTER_CLIENT.embeddings.create and the user sees
+# `(retrieval error: ...)`. The chat path degrades gracefully via
+# mark_offline() and the local-only cascade, but the RAG path does
+# not. Once the embedding cascade exists in commit 2, this command's
+# exception handlers should call mark_offline() on connectivity-shaped
+# embedding failures and prefer a local embedding model from the
+# cascade — same pattern as `_call_with_failover`.
+rag.configure(OPENROUTER_CLIENT)
 
 # ----------------------------------------------------------------------
 # Model registry
@@ -333,6 +350,7 @@ print(
     "'last topic?', "
     "'model deepseek | gemini | llama-free | qwen-free | laguna-free | "
     "gemini-free | qwen | gemma | phi', "
+    "'ingest <path>', 'ask <question>', "
     "'exit'."
 )
 print(f"(Loaded {len(messages) - 1} message(s) from {HISTORY_FILE})\n")
@@ -380,6 +398,68 @@ while True:
 
     if cmd == "model":
         print(f"Active: {active_label} {status_line()}")
+        continue
+
+    # ---- RAG: ingest a folder of documents into the vector store ----
+    if cmd.startswith("ingest "):
+        path = user_input.split(" ", 1)[1].strip().strip('"').strip("'")
+        print(f"Ingesting '{path}'... (this may take a while on first run)")
+        try:
+            result = rag.ingest_folder(path)
+        except Exception as e:
+            print(f"(ingest error: {e})")
+            continue
+        print(
+            f"Ingested {result['added']} new, "
+            f"updated {result['updated']} in place, "
+            f"orphaned {result['orphaned']} stale chunks "
+            f"in {rag.collection_name()}.\n"
+        )
+        continue
+
+    if cmd == "ingest":
+        print("Usage: ingest <path>  (folder or single .txt/.md file)")
+        continue
+
+    # ---- RAG: ask a question against the loaded documents ----
+    if cmd == "ask":
+        print("Usage: ask <question>")
+        continue
+    if cmd.startswith("ask "):
+        question = user_input.split(" ", 1)[1].strip()
+        if not question:
+            print("Usage: ask <question>")
+            continue
+        print(f"Retrieving for: {question}")
+        try:
+            aug = rag.build_augmented_messages(question, k=4)
+        except Exception as e:
+            print(f"(retrieval error: {e})")
+            continue
+        try:
+            stream = _call_with_failover(aug, stream=True)
+        except Exception as e:
+            print(f"(API error: {e})")
+            continue
+
+        reply = ""
+        print("Bot: ", end="", flush=True)
+        try:
+            for chunk in stream:
+                piece = chunk.choices[0].delta.content
+                if piece is None:
+                    continue
+                reply += piece
+                print(piece, end="", flush=True)
+        except Exception as e:
+            mark_offline()
+            print(f"\n(stream interrupted: {e})")
+            continue
+        print("\n")
+        speak(reply)
+        # Note: ask() does NOT append to messages — retrieval-augmented
+        # turns would pollute the persistent chat history with raw chunks.
+        mark_online()
         continue
 
     # ---- command: last topic? ----

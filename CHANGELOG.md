@@ -188,3 +188,62 @@ The user's perspective didn't change. Same commands, same `chat_history.json`, s
 - `chat_history.json` stays model-agnostic. Switching models mid-conversation just means the next call sends the same list to a different client. The model sees whatever the previous model wrote, including its own quirks. That's a feature for "compare two models on the same context" — not a bug to fix.
 
 **Next up (6.0):** token usage printed after each turn so the cost of persistence becomes visible. Same as before — this entry doesn't deliver it.
+
+## rag.py — folder ingest + ask, single embedding tier (commit 1 of 3)
+
+**Added:** a new module `rag.py` with a single-tier retrieval pipeline, plus two commands in `chatbot5.2.py`. No cascade yet — that's commit 2. No URL ingestion yet — that's commit 3. This entry is the smallest working RAG.
+
+**Why:** you can't ask the model about a folder of notes if the folder isn't part of its context. The classical fix is RAG: chunk, embed, store, retrieve, prepend the top hits to the user turn so the model can quote from them. "Augmented" generation. The reason commit 1 is *just* a single embedding tier with no failover is the same reason 3.0 was just streaming without TTS — once you mix cascade + RAG in one shot you can't tell which part of the answer came from which tier, or which embedding space mixed with which.
+
+**Added — `rag.py`:**
+- `OpenRouterEmbeddingFunction` — Chroma-compatible adapter that calls OpenRouter's `/embeddings` (which is OpenAI-compatible, so the OpenAI SDK works as-is) using `openai/text-embedding-3-small`, dim 1536. Single tier — `configure(client)` takes one client.
+- `_chunk_text()` — plain word-count splitter, 300-word chunks with 50-word overlap. No LangChain dependency. Returns a list of overlapping windows; the 50 words at the end of chunk N are the first 50 words of chunk N+1, so a sentence that straddles the boundary stays retrievable.
+- `_iter_documents(path)` — recursive folder walk that yields `(file_path, text)` for `.txt` and `.md`. Other extensions (including `.bin`) are silently skipped — that's how you can point it at a messy project directory and not get errors.
+- `ingest_folder(path)` — walks, chunks, embeds, and `coll.upsert()`s into Chroma. **Chunk IDs are content-addressed** (`{safe_path}__{index}__{sha256[:16]}`), so re-ingesting an unchanged file reports every chunk as `updated` (id matched, vector overwritten with the same value) and zero as `added`. Editing the file to shrink it or shift its chunk boundaries produces new hashes for the new chunks and *leaves the old chunks orphaned in the collection*, which the function reports as `orphaned` — committed-2's TODO is to delete-by-source before re-upserting to clean those up. Returns a dict `{"added": int, "updated": int, "orphaned": int}` so the chatbot can distinguish a fresh ingest from a no-op re-run.
+- `retrieve(query, k=4)` — `coll.query(query_texts=[query], n_results=k)`, returns just the text of the top-k chunks. No reranker, no metadata filtering, no hybrid search.
+- `SYSTEM_PROMPT` — instructs the model to answer *only* from the provided context, cite `[source: filename]` for every claim, and say "I don't know" when the context doesn't cover the question. Without this prompt the model ignores the retrieved context and answers from its training data, which defeats the whole point of RAG.
+- `build_augmented_messages(question, k=4)` — returns a two-turn message list `[system_with_rag_prompt, user_with_context_then_question]`. **Does NOT append to `messages`** — the retrieved chunks should not become part of `chat_history.json`. The RAG lookup is a per-turn side-effect, not a conversation act.
+- `_log_query()` — appends one JSON line per query to `./.chroma/query_log.jsonl` with `collection`, `model`, `dim`, `k`, `query`, `num_results`. This is the file that will prove commit 2's tier-switching works: you can `cat` the sidecar and see which embedding model served which query.
+
+**Changed — `chatbot5.2.py`:**
+- Imports `rag` and calls `rag.configure(OPENROUTER_CLIENT)` once at startup (after both clients are built, before the first user turn). All embedding work goes through that one client; in commit 2, the configure call will gain more arguments for the cascade.
+- Two new commands in the main loop, inserted after the `model` handler:
+  - `ingest <path>` — walks, embeds, prints `ingested N chunks into <collection name>`. Path can be relative (`./corpus`); the chroma store resolves to absolute.
+  - `ask <question>` — builds the augmented messages, sends them through `_call_with_failover(...)` so the same cascade that handles ordinary chat now handles RAG-augmented chat. Streams the reply and (in voice mode) speaks it. **Does not touch `chat_history.json`** — the assistant reply to an `ask` is not persisted by design; if you want it persisted, type the same question normally.
+- Startup banner now lists `ingest <path>` and `ask <question>` alongside the existing `voice` / `text` / `model` / `exit` commands.
+
+**Added — infrastructure:**
+- `chromadb 1.5.9` installed; `.chroma/` added to `.gitignore` (the persistent store is local-only; the source files in your corpus are what get shared, not the vectors).
+
+**Why this is three commits and not one:**
+Commit 1 ships the happy path: one embedding tier, one provider, folder ingest only. Commit 2 will add a cascade of tiers (e.g. text-embedding-3-small → BGE-M3 via Ollama → a smaller fallback), with `collection_name()` keyed on `{model_slug}_{dim}` so that different embedding spaces never share a collection. Without the sidecar log from this commit, you'd never be able to tell commit 2 was doing the right thing — you'd just see "queries work, what's the problem?". Commit 3 adds URL ingestion, which is the same `ingest_folder` pipeline with a fetcher in front of it. All three commits are independently demoable; you can stop after any of them and have a working tool.
+
+**Try it:**
+- `mkdir -p corpus && cat > corpus/hello.md <<'EOF'` — write a few paragraphs of anything.
+- Run `python3 chatbot5.2.py`, type `ingest ./corpus`, see `Ingested N new, updated 0 in place, orphaned 0 stale chunks in corpus_openai_text-embedding-3-small_1536.`
+- Run `ingest ./corpus` again — the second run reports `added 0, updated N, orphaned 0` (idempotent).
+- Edit `corpus/hello.md` to add or remove paragraphs and run `ingest ./corpus` again — the changed chunks show up as `added` and the old chunks from the prior version show up as `orphaned`. That's the signal to add a `delete by source` cleanup in commit 2.
+- `ask what does my notes say about <topic>?` — the bot now answers with quotes from your file and `[source: corpus/hello.md]` citations.
+- `rm -rf .chroma/` to start over (collection name and dimensions are baked into `collection_name()`, so changing embedding model in commit 2 won't reuse commit 1's vectors — by design).
+
+**Things you'll notice (intentional lessons):**
+- The OpenRouter embedding call adds one round-trip per query in addition to the chat completion. Cost is roughly `0.02 USD / 1M tokens` for `text-embedding-3-small`, and a typical chunk is 300 words ≈ 400 tokens, so a 100-document corpus costs on the order of a fraction of a cent to ingest. The chat completion is the dominant cost.
+- Retrieval quality is bounded by the chunking. 300/50 was chosen as a default that mostly works for prose — code and tables need different splits. Sentence-aware splitting (LangChain's `RecursiveCharacterTextSplitter`) is a one-import swap when you need it.
+- `ask` not touching `chat_history.json` is a deliberate distinction: the user said "ask my notes about X", they didn't say "have a conversation about X". If you DO want the answer persisted, type the same question without `ask` — both paths use the same underlying model, but only one writes to history.
+- Content-addressed chunk IDs surface the "I edited a file but my old chunks are still in the collection" problem as a visible `orphaned` count instead of silently corrupting retrieval. The fix for orphans is a `delete where source=path` pass before each upsert — that's the commit-2 TODO and the right place to put it because the cascade touches ingest anyway.
+- The sidecar log is the only place to see which embedding model served which query. Commit 2's dashboard will live in that file.
+
+**Next up (commit 2):** cascade of embedding tiers — same `collection_name()` shape, but multiple models, each in its own collection, with a tier selector that picks based on query length or a manual override.
+
+### rag.py — citation metadata wired through retrieve()
+
+**Changed:** `retrieve(query, k=4)` now returns `list[(text, source)]` instead of `list[str]`. `build_augmented_messages` formats each context chunk as `[N] [source: <path>] <chunk>`.
+
+**Why:** the original `retrieve()` returned only the chunk text and dropped Chroma's `metadatas` field. The system prompt told the model to cite sources — but the model can only cite what it's been shown. Without the source path in the prompt, even a perfectly grounded answer rendered without attribution.
+
+**Diff vs the first amend:**
+- `retrieve()` zips docs with metas and pairs each chunk with its `source` metadata field (written at ingest time).
+- `build_augmented_messages` unpacks the pairs to render `[source: ...]` inline next to each chunk.
+- Module docstring updated to reflect the new return shape.
+
+**No new behaviour at the model layer** — the model was already instructed to cite. The fix is purely in what data the prompt contains.
