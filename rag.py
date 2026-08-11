@@ -17,6 +17,8 @@ Public API:
   collection_name()             -> str   (current tier's collection)
 """
 
+from __future__ import annotations
+
 import os
 import re
 import hashlib
@@ -38,7 +40,7 @@ EMBEDDING_DIM = 1536  # text-embedding-3-small native dim
 _client = None
 
 
-def configure(openrouter_client, model_id=None, dim=None):
+def configure(openrouter_client, model_id: str | None = None, dim: int | None = None) -> None:
     """Wire the OpenRouter client into this module.
 
     Called once at chatbot startup. In commit 2, this is where the
@@ -67,27 +69,27 @@ class OpenRouterEmbeddingFunction:
     https://openrouter.ai/api/v1 with model="openai/text-embedding-3-small".
     """
 
-    def __init__(self, client, model_id):
+    def __init__(self, client, model_id: str) -> None:
         self._client = client
         self._model_id = model_id
 
     # Chroma's protocol: name attribute + __call__ returning list[list[float]]
-    def name(self):
+    def name(self) -> str:
         # stable identifier Chroma uses for caching
         return f"openrouter:{self._model_id}"
 
-    def __call__(self, input):
+    def __call__(self, input: list[str]) -> list[list[float]]:
         # Legacy Chroma interface: docs and queries both come through here
         # as input: Documents. Kept for backward compat.
         return self.embed_documents(input)
 
-    def embed_documents(self, input):
+    def embed_documents(self, input: list[str]) -> list[list[float]]:
         # Chroma calls this during collection.add / upsert.
         # input: list[str]
         resp = self._client.embeddings.create(model=self._model_id, input=input)
         return [d.embedding for d in resp.data]
 
-    def embed_query(self, input):
+    def embed_query(self, input: list[str]) -> list[list[float]]:
         # In chromadb 1.5.9:
         #   - input is a list[str] (the query_texts list)
         #   - return value is expected to be list[list[float]] (a list of
@@ -107,12 +109,12 @@ CHUNK_WORDS = 300
 CHUNK_OVERLAP_WORDS = 50
 
 
-def _chunk_text(text):
+def _chunk_text(text: str) -> list[str]:
     """Split text into ~CHUNK_WORDS-word chunks with overlap. Returns list[str]."""
     words = text.split()
     if not words:
         return []
-    chunks = []
+    chunks: list[str] = []
     step = CHUNK_WORDS - CHUNK_OVERLAP_WORDS
     for start in range(0, len(words), step):
         piece = words[start : start + CHUNK_WORDS]
@@ -131,16 +133,27 @@ def _chunk_text(text):
 _SUPPORTED_SUFFIXES = {".txt", ".md"}
 
 
-def _read_file(path):
-    """Read a file as text. Returns "" on read error."""
+def _read_file(path) -> str:
+    """Read a file as text. Returns "" on read error.
+
+    Read errors are surfaced to stderr rather than swallowed, so a
+    permission or encoding problem doesn't get mistaken for an empty
+    document downstream. We still return "" so the ingest pipeline can
+    skip the file without special-casing.
+    """
+    import sys
     try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
-    except (OSError, UnicodeDecodeError):
+    except OSError as e:
+        print(f"[rag] skip {path}: {e.__class__.__name__}: {e}", file=sys.stderr)
+        return ""
+    except UnicodeDecodeError as e:
+        print(f"[rag] skip {path}: not utf-8 ({e})", file=sys.stderr)
         return ""
 
 
-def _iter_documents(root):
+def _iter_documents(root: str | Path):
     """Yield (path_str, text) for every supported file under root (recursive)."""
     root = Path(root)
     if not root.exists():
@@ -168,26 +181,33 @@ def _iter_documents(root):
 # from `~/` would otherwise silently produce two separate stores with
 # identical names — ingest into one, ask from the other, "why doesn't
 # it remember what I ingested" mystery.
-CHROMA_DIR = str(Path(__file__).resolve().parent / ".chroma")
+#
+# Override with the RAG_CHROMA_DIR env var for containerized / PyInstaller
+# layouts where the script lives in a read-only image but the data should
+# live elsewhere (e.g. /data/chroma).
+CHROMA_DIR = os.environ.get(
+    "RAG_CHROMA_DIR",
+    str(Path(__file__).resolve().parent / ".chroma"),
+)
 
 
-def _safe_slug(model_id):
+def _safe_slug(model_id: str) -> str:
     """Filesystem-safe version of a model id: 'openai/text-embedding-3-small'
     -> 'openai_text-embedding-3-small'."""
     return re.sub(r"[/:.]", "_", model_id)
 
 
-def collection_name():
+def collection_name() -> str:
     """Name of the collection for the currently active embedding tier."""
     return f"corpus_{_safe_slug(EMBEDDING_MODEL_ID)}_{EMBEDDING_DIM}"
 
 
-def _chroma_client():
+def _chroma_client() -> chromadb.PersistentClient:
     """Persistent Chroma client. Stored in ./.chroma/ next to the script."""
     return chromadb.PersistentClient(path=CHROMA_DIR)
 
 
-def _get_or_create_collection():
+def _get_or_create_collection() -> chromadb.Collection:
     """Get the current tier's collection, creating it if missing."""
     if _client is None:
         raise RuntimeError("rag.configure(...) must be called before retrieval/ingest.")
@@ -217,7 +237,7 @@ def _chunk_id(source_path: str, chunk_index: int, text: str) -> str:
     return f"{safe}__{chunk_index}__{h}"
 
 
-def ingest_folder(path):
+def ingest_folder(path: str | Path) -> dict[str, int]:
     """Walk `path`, chunk every .txt/.md file, embed, upsert.
 
     Returns a dict ``{"added": int, "updated": int, "orphaned": int}``
@@ -261,13 +281,16 @@ def ingest_folder(path):
         # Look up which IDs are already present so we can skip the
         # embedding call for unchanged chunks. This is the difference
         # between "re-ingest a 1000-chunk corpus" costing 1000 embedding
-        # calls vs 0 once the corpus is stable.
-        existing = coll.get(ids=ids).get("ids", [])
+        # calls vs 0 once the corpus is stable. include=[] avoids
+        # pulling embedding vectors / documents across the Python
+        # boundary just to check existence (~6MB per 1000-chunk file).
+        existing: list[str] = coll.get(ids=ids, include=[]).get("ids", [])
         existing_set = set(existing)
         new_idx = [i for i, cid in enumerate(ids) if cid not in existing_set]
+        new_set = set(new_idx)
         for i, cid in enumerate(ids):
             seen_ids.add(cid)
-            if i in new_idx:
+            if i in new_set:
                 added += 1
             else:
                 updated += 1
@@ -298,7 +321,7 @@ def ingest_folder(path):
 # Retrieve + answer-augmentation
 # ----------------------------------------------------------------------
 
-def retrieve(query, k=4):
+def retrieve(query: str, k: int = 4) -> list[tuple[str, str]]:
     """Return the top-k most similar chunks for `query`.
 
     Returns a list of (text, source) tuples — one per retrieved chunk —
@@ -323,10 +346,13 @@ def retrieve(query, k=4):
 # one answered each query makes that visible in logs so silent dim-mixes
 # don't go unnoticed.
 
-_SIDECAR_PATH = "./.chroma/query_log.jsonl"
+_SIDECAR_PATH = os.environ.get(
+    "RAG_LOG_PATH",
+    str(Path(CHROMA_DIR) / "query_log.jsonl"),
+)
 
 
-def _log_query(query, chunks, k):
+def _log_query(query: str, chunks: list[str], k: int) -> None:
     """Append one line per query to a JSONL sidecar. Best-effort."""
     import json
     try:
@@ -352,7 +378,7 @@ SYSTEM_PROMPT = (
 )
 
 
-def build_augmented_messages(query, k=4):
+def build_augmented_messages(query: str, k: int = 4) -> list[dict]:
     """Build a chat-completions messages list with retrieval context.
 
     The system prompt establishes the ground rules, then a single user

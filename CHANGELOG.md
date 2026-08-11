@@ -235,6 +235,20 @@ Commit 1 ships the happy path: one embedding tier, one provider, folder ingest o
 
 **Next up (commit 2):** cascade of embedding tiers — same `collection_name()` shape, but multiple models, each in its own collection, with a tier selector that picks based on query length or a manual override.
 
+### rag.py — hygiene pass (no behavioural change)
+
+**Changed:**
+- `from __future__ import annotations` — modern type-hint syntax without importing `List`/`Dict` from `typing`.
+- Type hints on the public API (`configure`, `ingest_folder`, `retrieve`, `build_augmented_messages`), `OpenRouterEmbeddingFunction`'s four methods, `_chunk_text`, `_chunk_id`, `_read_file`, `_iter_documents`, `_safe_slug`, `collection_name`, `_chroma_client`, `_get_or_create_collection`, `_log_query`.
+- `existing: list[str] = coll.get(ids=ids, include=[]).get("ids", [])` — `include=[]` stops Chroma from round-tripping ~6 MB of float vectors per 1000-chunk file just to check existence. The IDs are the only field the bookkeeping loop needs.
+- `new_set = set(new_idx)` built once before the counter loop, so `if i in new_set` is O(1) per chunk instead of O(n).
+- `_read_file` no longer swallows `OSError`/`UnicodeDecodeError` silently. Permission and encoding problems now print `[rag] skip <path>: <ExcType>: <msg>` to stderr so a user doesn't mistake a bad file for an empty document.
+- `CHROMA_DIR` and the sidecar path now read from `RAG_CHROMA_DIR` / `RAG_LOG_PATH` env vars, falling back to the script-relative defaults. For Docker / PyInstaller setups where the script lives in a read-only image but data lives in `/data`.
+
+**Not changed:** the embedding tier, the chunking strategy, the orphan-cleanup policy, the system prompt, the cascade plan. This is purely a code-quality commit so the next set of changes (paragraph-aware chunker, delete-by-source, token-budget guard, embedding cascade) lands on a clean baseline.
+
+**Why a separate commit instead of folding in:** mixing "now `include=[]` is set" with "now I rewrite chunking" makes the diff unreadable. Each chunking rewrite will orphan every chunk in the existing corpus, and that's a *behavioural* change that deserves its own commit message — folding the structural changes into the same diff makes it hard to bisect later.
+
 ### rag.py — citation metadata wired through retrieve()
 
 **Changed:** `retrieve(query, k=4)` now returns `list[(text, source)]` instead of `list[str]`. `build_augmented_messages` formats each context chunk as `[N] [source: <path>] <chunk>`.
