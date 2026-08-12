@@ -261,3 +261,26 @@ Commit 1 ships the happy path: one embedding tier, one provider, folder ingest o
 - Module docstring updated to reflect the new return shape.
 
 **No new behaviour at the model layer** — the model was already instructed to cite. The fix is purely in what data the prompt contains.
+
+### rag.py — paragraph-aware chunker
+
+**Changed:** `_chunk_text` rewrote from a 300-word / 50-word sliding window into a 3-phase semantic splitter:
+
+1. **Paragraph phase.** Split on `\n\n`. Drop paragraphs that are pure Markdown formatting (ATX headers `# Title`, list markers `- item`, blockquotes `> text`, Setext underlines `======`). Those embed to near-zero-signal vectors and just dilute retrieval.
+2. **Sentence fallback.** If a paragraph exceeds `CHUNK_MAX_CHARS` (default 1500 chars), split on the regex `(?<=[.!?])\s+` and greedily pack sentences.
+3. **Hard-char fallback.** If a single sentence still exceeds `CHUNK_MAX_CHARS`, hard-split it every `CHUNK_MAX_CHARS - CHUNK_OVERLAP_CHARS` chars.
+
+Both limits are env-overridable: `RAG_CHUNK_MAX_CHARS` (default 1500), `RAG_CHUNK_OVERLAP_CHARS` (default 0). Overlap of zero was a deliberate choice — paragraph boundaries are self-contained seams, and an overlap across two unrelated paragraphs is worse than a clean break. Raise the env var if you want sliding-window behaviour.
+
+**Migration note — corpus invalidating.** Chunk boundaries changed, so every existing chunk ID in `.chroma/` becomes an orphan with respect to the new splitter. After pulling this commit, run `rm -rf .chroma/` once. The next `ingest_folder` will rebuild the store from source. Per-file `orphaned` counts from now on reflect "changed content in that file" — not "leftovers from an old chunker version".
+
+**Why a separate commit:** the chunk ID depends on chunk content (`_chunk_id` is a SHA-256 of `source + position + first 200 chars`). Changing chunk boundaries forces every chunk to re-ID. Folding this change into the same diff as the delete-by-source / retry / token-budget work would have made each of those commits look like a chunker change too.
+
+**Smoke-test results:**
+- 800-word wall (9200 chars, repetitive prose): 7 chunks, all ≤ 1471 chars. No over-limit chunks.
+- A single 5000-char paragraph with sentence stops (10999 chars): 8 chunks, all ≤ 1484 chars. No over-limit chunks.
+- One 5000-char sentence with no internal terminator: 4 chunks via the hard-char fallback (1500, 1500, 1500, 500). No over-limit chunks.
+- `corpus/foxes.md` (Markdown with headers + 4 body sections): 4 chunks — one per section, headers correctly dropped. Re-ingest is idempotent (`added: 0, updated: 4, orphaned: 0`).
+- Edge cases: empty string → `[]`, whitespace-only → `[]`, single line → 1 chunk.
+
+**Not changed:** the embedding tier, the cascade plan, the system prompt, the sidecar log shape, `RAG_CHROMA_DIR` / `RAG_LOG_PATH` env var overrides, the orphan-detection loop in `ingest_folder`.

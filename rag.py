@@ -101,29 +101,119 @@ class OpenRouterEmbeddingFunction:
 # ----------------------------------------------------------------------
 # Chunking
 # ----------------------------------------------------------------------
-# Plain word-count chunker with overlap. Good enough for commit 1.
-# If we need sentence-aware splitting later, swap this for
-# langchain.text_splitter.RecursiveCharacterTextSplitter — same API.
+# Semantic chunker: split on paragraph boundaries first, then sentence
+# boundaries if a single paragraph exceeds the limit, then a hard char
+# split as a final fallback so we can never exceed CHUNK_MAX_CHARS.
+#
+# Why not the old word-count chunker: slicing at word 300 ignores
+# sentence/paragraph boundaries, so embeddings cover mid-thought text and
+# the vector geometry gets noisy. The chunker here keeps whole paragraphs
+# together when possible, which is what prose retrieval actually wants.
+#
+# Defaults are char-based (~300 words / ~1500 chars per chunk). Override
+# with RAG_CHUNK_MAX_CHARS / RAG_CHUNK_OVERLAP_CHARS for code-heavy or
+# unusually long-paragraph corpora.
 
-CHUNK_WORDS = 300
-CHUNK_OVERLAP_WORDS = 50
+CHUNK_MAX_CHARS = int(os.environ.get("RAG_CHUNK_MAX_CHARS", "1500"))
+CHUNK_OVERLAP_CHARS = int(os.environ.get("RAG_CHUNK_OVERLAP_CHARS", "0"))
+
+# Sentence boundary: terminal punctuation followed by whitespace.
+# Lookbehind keeps the punctuation attached to its sentence.
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+
+def _is_formatting_paragraph(p: str) -> bool:
+    """True if a paragraph is pure Markdown formatting (no real content).
+
+    Targets:
+      - ATX headers: '# Title', '## Section'
+      - Setext underlines: '======' or '------' (single line of only those chars)
+      - Unordered list items: '- item', '* item'
+      - Blockquotes: '> quoted text'
+
+    Skips long no-whitespace content (e.g. minified code, base64 blobs) —
+    those are real content even if word-sparse.
+    """
+    s = p.lstrip()
+    if not s:
+        return True
+    if s[0] == "#":
+        return True
+    if s[0] in {"-", "*", ">"}:
+        # Pure list/quote: short, no useful prose.
+        # Be lenient: only treat as formatting if also short or single-line.
+        if "\n" not in s and len(s) <= 200:
+            return True
+        # Multi-line list/blockquote: keep it.
+        return False
+    # Setext underline: a line of only = or - characters.
+    if len(s) <= 80 and s.strip() and set(s.strip()) <= {"=", "-"}:
+        return True
+    return False
 
 
 def _chunk_text(text: str) -> list[str]:
-    """Split text into ~CHUNK_WORDS-word chunks with overlap. Returns list[str]."""
-    words = text.split()
-    if not words:
+    """Split text into semantic chunks. Returns list[str].
+
+    Three-phase split:
+      1. On paragraph boundaries (\\n\\n).
+      2. On sentence boundaries (after [.!?] + whitespace) when a single
+         paragraph exceeds CHUNK_MAX_CHARS.
+      3. Hard char split as a final fallback so no chunk can ever exceed
+         the limit.
+
+    Overlap is appended (last N chars of previous chunk prepended to the
+    next), not a sliding window. With paragraph-structured prose the
+    overlap default is 0 because paragraphs are self-contained seams;
+    bump it back up via RAG_CHUNK_OVERLAP_CHARS for fragmented input.
+    """
+    if not text or not text.strip():
         return []
+
     chunks: list[str] = []
-    step = CHUNK_WORDS - CHUNK_OVERLAP_WORDS
-    for start in range(0, len(words), step):
-        piece = words[start : start + CHUNK_WORDS]
-        if not piece:
-            break
-        chunks.append(" ".join(piece))
-        if start + CHUNK_WORDS >= len(words):
-            break
-    return chunks
+
+    # Phase 1: split on paragraph boundaries. Drop paragraphs that are
+    # pure Markdown formatting (headers, list markers, empty containers)
+    # — they embed to near-zero-signal vectors that just dilute retrieval.
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    paragraphs = [p for p in paragraphs if not _is_formatting_paragraph(p)]
+    for para in paragraphs:
+        if len(para) <= CHUNK_MAX_CHARS:
+            chunks.append(para)
+            continue
+
+        # Phase 2: paragraph too long — split on sentence boundaries.
+        sentences = _SENTENCE_SPLIT.split(para)
+        current = ""
+        for sent in sentences:
+            # +1 for the space we'd insert between sentences.
+            if len(current) + len(sent) + 1 <= CHUNK_MAX_CHARS:
+                current = f"{current} {sent}".strip() if current else sent
+                continue
+            if current:
+                chunks.append(current)
+            # Phase 3: single sentence still exceeds limit — hard split.
+            if len(sent) > CHUNK_MAX_CHARS:
+                step = max(1, CHUNK_MAX_CHARS - CHUNK_OVERLAP_CHARS)
+                for i in range(0, len(sent), step):
+                    chunks.append(sent[i : i + CHUNK_MAX_CHARS])
+                current = ""
+            else:
+                current = sent
+        if current:
+            chunks.append(current)
+
+    # Overlap step: append trailing chars from the previous chunk to the
+    # next. Skipped entirely if there's nothing to overlap (single chunk,
+    # or CHUNK_OVERLAP_CHARS == 0).
+    if CHUNK_OVERLAP_CHARS <= 0 or len(chunks) <= 1:
+        return chunks
+    overlapped: list[str] = [chunks[0]]
+    for chunk in chunks[1:]:
+        prev = overlapped[-1]
+        tail = prev[-CHUNK_OVERLAP_CHARS:] if len(prev) > CHUNK_OVERLAP_CHARS else prev
+        overlapped.append(f"{tail}\n\n{chunk}")
+    return overlapped
 
 
 # ----------------------------------------------------------------------
