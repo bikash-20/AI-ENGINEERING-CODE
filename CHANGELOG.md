@@ -2,6 +2,38 @@
 
 Each entry is the smallest change that teaches one new idea. Read the diff between versions to see what was learned.
 
+## Patch — voice_utils.speak() now uses macOS `say` directly
+
+**This is a fix, not a feature.** I am not bumping a version number.
+
+**Symptom:** after a streamed reply finished, the terminal got flooded with thousands of Unicode emoji glyphs — every character of the bot's reply got "spoken" by being printed to stdout.
+
+**Suspected cause:** `pyttsx3` on newer macOS + Python combinations (3.14, fresh installs, missing `pyobjc` bindings) fails to load the `osxppy` driver. With no driver bound, `pyttsx3.init()` falls back to a stub that "says" each glyph by emitting it as a Unicode replacement character. The bot thinks it spoke; your terminal eats the dump.
+
+**Change:** `voice_utils.speak(text)` now shells out to `/usr/bin/say` directly via `subprocess.run(["say", text], check=False)`. That's the same command `pyttsx3`'s macOS driver was supposed to invoke anyway, and it's already on every macOS install — no third-party package, no `pyobjc`, no driver wheel to debug.
+
+```python
+def speak(text):
+    if not text:
+        return
+    import subprocess
+    try:
+        subprocess.run(["say", text], check=False)
+    except FileNotFoundError:
+        pass  # not on macOS — silent no-op
+    except Exception as e:
+        print(f"(speak failed: {e})")
+```
+
+**Side effects:**
+- Removed `pyttsx3` from the install list in `README.md`. You can also drop `pyobjc` if it was installed only for this.
+- On Linux/Windows, `say` is missing — `speak()` is now a silent no-op there instead of crashing. Voice output is macOS-only; the rest of the chatbot (chat, `model`, `ingest`, `ask`) is unaffected on any platform.
+- The fallback `print(f"(speak failed: ...)")` keeps TTS failures from breaking the chatbot loop. Voice is polish, not correctness.
+
+**Revert:** in `voice_utils.py`, restore the old `pyttsx3`-based `speak()` from the previous version of this file. Then `pip install pyttsx3 pyobjc` to bring the bindings back. Only do this if `say` itself stops working on your machine — which would be unusual.
+
+**Try it:** `python3 -c "from voice_utils import speak; speak('hello world')"` — you should hear the system voice, not see an emoji dump.
+
 ## chatbot2.0.py — system prompt
 
 **Added:** one new piece of state — a `system` turn at the very start of `messages`.

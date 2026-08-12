@@ -60,20 +60,31 @@ def mark_online():
 
 
 # ----------------------------------------------------------------------
-# TTS — pyttsx3, offline. Unchanged behavior.
+# TTS — macOS `say`, offline. No third-party driver needed.
 # ----------------------------------------------------------------------
-
-_tts_engine = None
-
+# Previously this used pyttsx3, which on newer macOS / Python combinations
+# (3.14, fresh installs) fails to bind the NSSpeechSynthesizer driver and
+# ends up "saying" the text by dumping each glyph to stdout as a Unicode
+# emoji replacement. `subprocess.run(["say", ...])` uses the native macOS
+# TTS directly, which is what pyttsx3's macOS driver was shelling out to
+# anyway. On Linux/Windows this is a no-op; the caller should already be
+# gating on input_mode == "voice" / "text" before invoking speak().
 
 def speak(text):
-    """Convert text to speech and play it out loud (offline via pyttsx3)."""
-    global _tts_engine
-    if _tts_engine is None:
-        import pyttsx3
-        _tts_engine = pyttsx3.init()
-    _tts_engine.say(text)
-    _tts_engine.runAndWait()
+    """Speak `text` out loud via the macOS `say` command. No-op on non-mac."""
+    if not text:
+        return
+    import subprocess
+    try:
+        subprocess.run(["say", text], check=False)
+    except FileNotFoundError:
+        # `say` is missing — we're not on macOS, or it was removed. Silently
+        # no-op rather than crashing the chatbot loop on every reply.
+        pass
+    except Exception as e:
+        # Any other failure (broken pipe, weird argv) must not break the
+        # chatbot. Voice is a polish feature, not a correctness one.
+        print(f"(speak failed: {e})")
 
 
 # ----------------------------------------------------------------------

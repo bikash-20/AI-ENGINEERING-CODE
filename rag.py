@@ -12,7 +12,7 @@ changing callers.
 
 Public API:
   ingest_folder(path)           -> dict  {"added", "updated", "orphaned"}
-  retrieve(query, k=4)          -> list[(text, source)]  (top-k chunks w/ source)
+  retrieve(query, k=4)          -> list[(text, source, page)]  (top-k chunks; page is None for non-PDFs)
   build_augmented_messages(query, k=4) -> list[dict]  (chat-completions shape)
   collection_name()             -> str   (current tier's collection)
 """
@@ -253,10 +253,10 @@ def _chunk_text(text: str) -> list[str]:
 
 
 # ----------------------------------------------------------------------
-# File loading (commit 1: .txt and .md only)
+# File loading (commit 1: .txt and .md; patched: .pdf via PyMuPDF)
 # ----------------------------------------------------------------------
 
-_SUPPORTED_SUFFIXES = {".txt", ".md"}
+_SUPPORTED_SUFFIXES = {".txt", ".md", ".pdf"}
 
 
 def _read_file(path) -> str:
@@ -279,22 +279,88 @@ def _read_file(path) -> str:
         return ""
 
 
+def _read_pdf(path) -> list[tuple[str, int]]:
+    """Read a PDF page-by-page using PyMuPDF. Returns [(text, page_number), ...].
+
+    PDFs are processed one page at a time so we never hold the entire
+    document in memory at once — a 500-page PDF shouldn't mean 500 pages
+    of strings sitting in RAM before chunking even starts.
+
+    Handles these failure modes gracefully:
+      - PyMuPDF not installed            -> ImportError propagates; caller sees it.
+      - Encrypted / password-protected   -> returns []; prints to stderr.
+      - Corrupt / unreadable pages       -> skips that page; prints to stderr.
+      - Empty / zero-page PDF            -> returns []; no error.
+    """
+    import sys
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        print(
+            f"[rag] skip PDF {path}: PyMuPDF not installed. "
+            f"Install with: pip install pymupdf",
+            file=sys.stderr,
+        )
+        return []
+
+    out: list[tuple[str, int]] = []
+    try:
+        doc = fitz.open(path)
+    except Exception as e:
+        print(f"[rag] skip PDF {path}: cannot open ({e})", file=sys.stderr)
+        return []
+
+    try:
+        if doc.is_encrypted:
+            print(f"[rag] skip PDF {path}: encrypted / password-protected", file=sys.stderr)
+            return []
+        # page count is 1-indexed in citations, matches the rendered "page N"
+        # most PDF readers show.
+        for i, page in enumerate(doc, start=1):
+            try:
+                text = page.get_text("text") or ""
+            except Exception as e:
+                print(f"[rag] skip page {i} of {path}: {e}", file=sys.stderr)
+                continue
+            if text.strip():
+                out.append((text, i))
+    finally:
+        doc.close()
+    return out
+
+
 def _iter_documents(root: str | Path):
-    """Yield (path_str, text) for every supported file under root (recursive)."""
+    """Yield (path_str, text, page | None) for every supported file under root.
+
+    The third element is the 1-indexed page number for PDFs, or None for
+    plain-text files. Keeping the shape uniform lets the ingest loop treat
+    .txt/.md and .pdf identically: chunk, hash, upsert — only the metadata
+    payload differs (page is added when present).
+    """
     root = Path(root)
     if not root.exists():
         return
     if root.is_file():
-        if root.suffix.lower() in _SUPPORTED_SUFFIXES:
+        suf = root.suffix.lower()
+        if suf in {".txt", ".md"}:
             text = _read_file(root)
             if text:
-                yield (str(root), text)
+                yield (str(root), text, None)
+        elif suf == ".pdf":
+            for page_text, page_num in _read_pdf(root):
+                yield (str(root), page_text, page_num)
         return
     for p in root.rglob("*"):
-        if p.is_file() and p.suffix.lower() in _SUPPORTED_SUFFIXES:
+        if not p.is_file():
+            continue
+        suf = p.suffix.lower()
+        if suf in {".txt", ".md"}:
             text = _read_file(p)
             if text:
-                yield (str(p), text)
+                yield (str(p), text, None)
+        elif suf == ".pdf":
+            for page_text, page_num in _read_pdf(p):
+                yield (str(p), page_text, page_num)
 
 
 # ----------------------------------------------------------------------
@@ -350,17 +416,24 @@ def _get_or_create_collection() -> chromadb.Collection:
 # Ingest
 # ----------------------------------------------------------------------
 
-def _chunk_id(source_path: str, chunk_index: int, text: str) -> str:
-    """Deterministic chunk id derived from (path, index, content).
+def _chunk_id(source_path: str, chunk_index: int, text: str, page: int | None = None) -> str:
+    """Deterministic chunk id derived from (path, index, page, content).
 
     Including a content hash means editing a file produces new IDs for
     shifted chunks instead of silently overwriting old chunk text with
     new chunk text at the same ID. The downside is that *old* chunks
     become orphans in the collection — see the commit-2 TODO.
+
+    `page` is included in the hash for PDFs so that re-ingesting a PDF
+    whose content has not changed produces the same IDs (no duplicate
+    chunks). Without page in the ID, two pages of the same PDF would
+    share an ID namespace at index 0 and collide with each other.
     """
-    h = hashlib.sha256(f"{source_path}:{chunk_index}:{text}".encode()).hexdigest()[:16]
+    page_key = page if page is not None else "na"
+    h = hashlib.sha256(f"{source_path}:{page_key}:{chunk_index}:{text}".encode()).hexdigest()[:16]
     safe = source_path.replace(os.sep, "_").replace(":", "_")
-    return f"{safe}__{chunk_index}__{h}"
+    page_tag = f"_p{page}" if page is not None else ""
+    return f"{safe}{page_tag}__{chunk_index}__{h}"
 
 
 def ingest_folder(path: str | Path) -> dict[str, int]:
@@ -395,15 +468,17 @@ def ingest_folder(path: str | Path) -> dict[str, int]:
     coll = _get_or_create_collection()
     added = updated = 0
     seen_ids: set[str] = set()
-    for file_path, text in _iter_documents(path):
+    for file_path, text, page in _iter_documents(path):
         chunks = _chunk_text(text)
         if not chunks:
             continue
-        ids = [_chunk_id(file_path, i, c) for i, c in enumerate(chunks)]
-        metadatas = [
-            {"source": file_path, "chunk": i, "model": EMBEDDING_MODEL_ID}
-            for i in range(len(chunks))
-        ]
+        ids = [_chunk_id(file_path, i, c, page) for i, c in enumerate(chunks)]
+        metadatas = []
+        for i_only in range(len(chunks)):
+            md = {"source": file_path, "chunk": i_only, "model": EMBEDDING_MODEL_ID}
+            if page is not None:
+                md["page"] = page
+            metadatas.append(md)
         # Look up which IDs are already present so we can skip the
         # embedding call for unchanged chunks. This is the difference
         # between "re-ingest a 1000-chunk corpus" costing 1000 embedding
@@ -433,9 +508,17 @@ def ingest_folder(path: str | Path) -> dict[str, int]:
     # but an id we did not see this run is a stale chunk from a prior
     # edit. Cheap because the collection has a metadata index on
     # "source" (Chroma does this automatically for metadata fields).
+    #
+    # `_iter_documents` yields one tuple *per page* for PDFs, so we must
+    # dedupe on `source` here. Otherwise a 3-page PDF would have each of
+    # its orphan IDs counted three times (once per page-yield).
     orphaned = 0
     if seen_ids:
-        for file_path, _ in _iter_documents(path):
+        queried_sources: set[str] = set()
+        for file_path, _, _ in _iter_documents(path):
+            if file_path in queried_sources:
+                continue
+            queried_sources.add(file_path)
             prior = coll.get(where={"source": file_path}).get("ids", [])
             for cid in prior:
                 if cid not in seen_ids:
@@ -450,7 +533,11 @@ def ingest_folder(path: str | Path) -> dict[str, int]:
     # the delete-or-print decision is gated.
     all_ids = coll.get(include=[]).get("ids", [])
     all_metas = coll.get(include=["metadatas"]).get("metadatas", [])
-    live_sources = {str(p) for p, _ in _iter_documents(path)}
+    # Same dedupe-by-source rationale as the orphan loop above: PDFs yield
+    # once per page, so a comprehension over the raw generator would emit
+    # the same path N times (harmless for set membership, but misleading
+    # if anyone logs the resulting set).
+    live_sources = {p for p, _, _ in _iter_documents(path)}
     stale_by_source: dict[str, list[str]] = {}
     for cid, meta in zip(all_ids, all_metas):
         src = (meta or {}).get("source")
@@ -483,12 +570,14 @@ def ingest_folder(path: str | Path) -> dict[str, int]:
 # Retrieve + answer-augmentation
 # ----------------------------------------------------------------------
 
-def retrieve(query: str, k: int = 4) -> list[tuple[str, str]]:
+def retrieve(query: str, k: int = 4) -> list[tuple[str, str, int | None]]:
     """Return the top-k most similar chunks for `query`.
 
-    Returns a list of (text, source) tuples — one per retrieved chunk —
-    so callers can render [source: <path>] in the context block. `source`
-    comes from the `source` metadata field written at ingest time.
+    Returns a list of (text, source, page) tuples — one per retrieved
+    chunk — so callers can render `[source: <path>]` (or
+    `[source: <path>#p<page>]` for PDFs) in the context block. `source`
+    and `page` come from the metadata fields written at ingest time;
+    `page` is None for non-PDF sources.
     """
     coll = _get_or_create_collection()
     res = coll.query(query_texts=[query], n_results=k)
@@ -496,8 +585,14 @@ def retrieve(query: str, k: int = 4) -> list[tuple[str, str]]:
     metas = res.get("metadatas", [[]])[0]
     # zip is safe here: chroma returns parallel lists, and lengths match
     # even when one side is empty (both will be empty lists).
-    return [(doc, (meta or {}).get("source", "<unknown>"))
-            for doc, meta in zip(docs, metas)]
+    out: list[tuple[str, str, int | None]] = []
+    for doc, meta in zip(docs, metas):
+        meta = meta or {}
+        page_val = meta.get("page")
+        # Chroma returns ints for int metadata; coerce defensively.
+        page = int(page_val) if isinstance(page_val, (int, float)) else None
+        out.append((doc, meta.get("source", "<unknown>"), page))
+    return out
 
 
 # ----------------------------------------------------------------------
@@ -595,7 +690,7 @@ def build_augmented_messages(query: str, k: int = 4) -> list[dict]:
     chunks = retrieve(query, k=k)
 
     if not chunks:
-        _log_query(query, [t for t, _ in chunks], k)
+        _log_query(query, [t for t, _, _ in chunks], k)
         # nothing in the store — fall back to a plain chat-style message
         return [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -607,11 +702,12 @@ def build_augmented_messages(query: str, k: int = 4) -> list[dict]:
 
     # Token-budget guard. Walk chunks in retrieval order, drop the tail
     # once we'd exceed the budget. k_actual is what we actually kept.
-    kept: list[tuple[str, str]] = []
+    kept: list[tuple[str, str, int | None]] = []
     budget_tokens = 0
     truncated = False
-    for text, source in chunks:
-        formatted = f"[{len(kept)+1}] [source: {source}] {text}"
+    for text, source, page in chunks:
+        cite = f"{source}#p{page}" if page is not None else source
+        formatted = f"[{len(kept)+1}] [source: {cite}] {text}"
         chunk_tokens = _estimate_tokens(formatted) + 4  # +4 for separator overhead
         if budget_tokens + chunk_tokens > MAX_CONTEXT_TOKENS:
             print(
@@ -621,14 +717,14 @@ def build_augmented_messages(query: str, k: int = 4) -> list[dict]:
             )
             truncated = True
             break
-        kept.append((text, source))
+        kept.append((text, source, page))
         budget_tokens += chunk_tokens
 
     # Log after truncation so the sidecar carries the actual post-budget
     # chunk count, not just the requested k.
     _log_query(
         query,
-        [t for t, _ in kept],
+        [t for t, _, _ in kept],
         k,
         k_actual=len(kept) if truncated else None,
         budget_tokens=MAX_CONTEXT_TOKENS if truncated else None,
@@ -645,8 +741,8 @@ def build_augmented_messages(query: str, k: int = 4) -> list[dict]:
         ]
 
     context_block = "\n\n---\n\n".join(
-        f"[{i+1}] [source: {source}] {text}"
-        for i, (text, source) in enumerate(kept)
+        f"[{i+1}] [source: {(f'{source}#p{page}' if page is not None else source)}] {text}"
+        for i, (text, source, page) in enumerate(kept)
     )
     return [
         {"role": "system", "content": SYSTEM_PROMPT},

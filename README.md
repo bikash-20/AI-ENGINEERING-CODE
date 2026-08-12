@@ -9,7 +9,7 @@ The version suffix (`1.0`, `5.2`, …) is intentional: I bump it when the logic 
 | File | What it teaches |
 |---|---|
 | `chatbot5.2.py` | The current chatbot. Multi-provider (OpenRouter, Gemini, Ollama), online/offline cascade, streaming, persistent history, voice/text mode, `model X` switching, `last topic?` command. |
-| `voice_utils.py` | Three concerns — `speak(text)` (offline TTS via `pyttsx3`), `listen()` (hybrid STT: Google online, local faster-whisper server offline), and `has_internet()` + `set_online(bool)` / `mark_offline()` for the connectivity cache. |
+| `voice_utils.py` | Three concerns — `speak(text)` (offline TTS via the macOS `say` command), `listen()` (hybrid STT: Google online, local faster-whisper server offline), and `has_internet()` + `set_online(bool)` / `mark_offline()` for the connectivity cache. |
 | `CHANGELOG.md` | Every version bump, why it happened, what changed, what to try, and what's coming next. Read top-to-bottom to follow the learning curve. |
 | `.env` / `.env.example` | API keys. `.env` is gitignored; `.env.example` is the safe template. |
 | `chat_history.json` | Persisted `messages` list. Created on first run, updated every turn. Safe to delete for a fresh start. |
@@ -76,10 +76,10 @@ Keys live at <https://openrouter.ai/keys> and <https://aistudio.google.com/apike
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install openai python-dotenv pyttsx3 SpeechRecognition
+pip install openai python-dotenv SpeechRecognition
 ```
 
-`pyttsx3` is required even in text-only mode because `voice_utils.speak()` is called after every successful reply when voice mode is on. If you never plan to use `voice`, you can skip both `pyttsx3` and `SpeechRecognition` and avoid the macOS mic-permission prompts.
+`SpeechRecognition` (and the underlying `pyaudio`) is only needed if you plan to use voice mode. Text-only mode skips the mic stack entirely. TTS uses the macOS `say` command directly — no third-party driver, no `pyttsx3` install.
 
 ### 3. (Optional) Local Ollama
 
@@ -120,7 +120,7 @@ Type to chat, `voice` to talk, `model phi` to go offline, `exit` to quit. Delete
 
 ### macOS voice notes
 
-- `pyttsx3` on macOS uses the built-in `say` command. No extra install.
+- TTS uses macOS's built-in `say` command directly (via `subprocess`). No extra install, no driver bindings to debug. On Linux/Windows the call is a no-op — voice output is macOS-only here.
 - The first time you run a listening script, macOS will prompt for microphone access. System Settings → Privacy & Security → **Microphone** → enable your terminal app (Terminal, iTerm, VS Code, …).
 - The mic-calibration half-second (`adjust_for_ambient_noise`) in `voice_utils.listen()` exists specifically because the bot's own TTS plays through the same speakers the mic is sitting next to. Without it, the recognizer auto-tunes its threshold against the bot's tail-end audio and bails on your first word. See the patch entry in `CHANGELOG.md`.
 
