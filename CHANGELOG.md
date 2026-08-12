@@ -284,3 +284,33 @@ Both limits are env-overridable: `RAG_CHUNK_MAX_CHARS` (default 1500), `RAG_CHUN
 - Edge cases: empty string → `[]`, whitespace-only → `[]`, single line → 1 chunk.
 
 **Not changed:** the embedding tier, the cascade plan, the system prompt, the sidecar log shape, `RAG_CHROMA_DIR` / `RAG_LOG_PATH` env var overrides, the orphan-detection loop in `ingest_folder`.
+
+### rag.py — delete-by-source, embedding retry, token-budget guard
+
+Three independent additions, batched into one commit because they share the same theme: hard surfaces around the embedding + retrieval pipeline that were previously left implicit.
+
+**1. Delete-by-source (opt-in, default off).** `ingest_folder` now scans the collection for chunks whose `source` metadata points at a path no longer in the folder, and either deletes them or prints what it would delete:
+
+- `RAG_DELETE_MISSING_SOURCES=false` (default): prints `[rag] would delete N chunks from <path> (RAG_DELETE_MISSING_SOURCES=off)` per missing source.
+- `RAG_DELETE_MISSING_SOURCES=true`: calls `coll.delete(ids=[...])` and prints `[rag] deleted N chunks from <path>`.
+
+Why opt-in: silently deleting data on every ingest is the kind of footgun where a single corrupted path argument wipes a corpus. Dry-run default makes the user opt into the destructive path explicitly.
+
+**2. Embedding retry with jittered backoff.** `OpenRouterEmbeddingFunction._with_retry(fn, attempts=2)` wraps the `_client.embeddings.create(...)` call so a single transient 5xx/429 from OpenRouter is recovered automatically. Backoff: `(2 ** attempt) + random.random()` seconds — 1-2s before the first retry, no sleep after the final attempt. No tenacity dep.
+
+Why: a transient embedding failure during ingest shouldn't require a manual re-run for a single bad chunk. Two attempts (not three) because the second attempt rarely helps in practice and the jitter is enough to clear most rate-limit windows.
+
+**3. Token-budget guard.** `build_augmented_messages(query, k=4)` walks the retrieved chunks in order, formats each as `[N] [source: ...] <chunk>`, and drops the tail once the running total exceeds `MAX_CONTEXT_TOKENS` (env `RAG_MAX_CONTEXT_TOKENS`, default 3000). When truncation fires:
+
+- stderr gets `[rag] truncated context k->actual_k (used_tokens, budget)`.
+- the sidecar JSONL gets a record with `k_actual`, `budget_tokens`, `used_tokens` keys added (omitted on non-truncated queries so the sidecar stays compact).
+
+Token estimation is a heuristic (`max(0.75 * word_count, 0.25 * char_count)`) because adding a real tokenizer just for a guardrail is the wrong trade — we're bounding a 4k-context model from a 50k-char context block, not billing precisely. Within ~15% of tiktoken cl100k_base on normal English prose.
+
+**Smoke-tested:**
+- Delete-by-source dry-run prints expected deletions across two missing source files.
+- Delete-by-source with `RAG_DELETE_MISSING_SOURCES=true` removes the right chunks; subsequent `retrieve()` no longer surfaces them.
+- Embedding retry: stub client that fails once then succeeds is recovered on call 2; persistent failure re-raises after attempt 2.
+- Token-budget test at `RAG_MAX_CONTEXT_TOKENS=50`: 4 requested → 2 in prompt, stderr warning printed, sidecar carries `k_actual=2`.
+
+**Not changed:** the chunker (A1), the embedding tier, the system prompt, the cascade plan, the `_log_query` shape for non-truncated queries.

@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import os
 import re
+import time
+import random
 import hashlib
 from pathlib import Path
 
@@ -86,8 +88,7 @@ class OpenRouterEmbeddingFunction:
     def embed_documents(self, input: list[str]) -> list[list[float]]:
         # Chroma calls this during collection.add / upsert.
         # input: list[str]
-        resp = self._client.embeddings.create(model=self._model_id, input=input)
-        return [d.embedding for d in resp.data]
+        return self._with_retry(lambda: self._do_embed(input))
 
     def embed_query(self, input: list[str]) -> list[list[float]]:
         # In chromadb 1.5.9:
@@ -96,6 +97,41 @@ class OpenRouterEmbeddingFunction:
         #     query embeddings, one per query), not a single list[float].
         # Return the full batch from embed_documents unwrapped.
         return self.embed_documents(input)
+
+    def _do_embed(self, input: list[str]) -> list[list[float]]:
+        resp = self._client.embeddings.create(model=self._model_id, input=input)
+        return [d.embedding for d in resp.data]
+
+    @staticmethod
+    def _with_retry(fn, *, attempts: int = 2) -> list[list[float]]:
+        """Call `fn` with up to `attempts` tries and jittered backoff.
+
+        Why: OpenRouter occasionally returns transient 5xx/429 for an
+        embedding call while the rest of the request graph is fine. One
+        retry with backoff recovers from most of these without forcing
+        the user to re-run ingest.
+
+        Backoff schedule: sleep = (2 ** attempt) + random.random(),
+        which is 1-2s before the first retry. We never sleep after the
+        final attempt — we just re-raise. No tenacity dep.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                return fn()
+            except Exception as e:  # broad: openai SDK raises varied subclasses
+                last_exc = e
+                if attempt + 1 >= attempts:
+                    break
+                sleep_for = (2 ** attempt) + random.random()
+                print(
+                    f"[rag] embed attempt {attempt + 1} failed ({type(e).__name__}: {e}); "
+                    f"retrying in {sleep_for:.1f}s",
+                    file=__import__("sys").stderr,
+                )
+                time.sleep(sleep_for)
+        assert last_exc is not None  # loop only exits via break+exception or return
+        raise last_exc
 
 
 # ----------------------------------------------------------------------
@@ -404,6 +440,42 @@ def ingest_folder(path: str | Path) -> dict[str, int]:
             for cid in prior:
                 if cid not in seen_ids:
                     orphaned += 1
+
+    # Delete-by-source: chunks whose source file is no longer present in
+    # the folder at all (vs. just edited). Gated by an env switch so the
+    # default behaviour stays "report, don't touch".
+    delete_mode = os.environ.get("RAG_DELETE_MISSING_SOURCES", "false").lower()
+    delete_mode_on = delete_mode in {"1", "true", "yes", "on"}
+    # Always scan for stale-by-source chunks, regardless of mode. Only
+    # the delete-or-print decision is gated.
+    all_ids = coll.get(include=[]).get("ids", [])
+    all_metas = coll.get(include=["metadatas"]).get("metadatas", [])
+    live_sources = {str(p) for p, _ in _iter_documents(path)}
+    stale_by_source: dict[str, list[str]] = {}
+    for cid, meta in zip(all_ids, all_metas):
+        src = (meta or {}).get("source")
+        if src is None:
+            continue
+        if src not in live_sources:
+            stale_by_source.setdefault(src, []).append(cid)
+    if delete_mode_on:
+        # Roll up all stale chunk IDs across every missing source and
+        # delete in one call.
+        all_stale = [cid for ids in stale_by_source.values() for cid in ids]
+        if all_stale:
+            coll.delete(ids=all_stale)
+            for src, ids in stale_by_source.items():
+                print(
+                    f"[rag] deleted {len(ids)} chunks from {src}",
+                    file=__import__("sys").stderr,
+                )
+    else:
+        for src, ids in stale_by_source.items():
+            print(
+                f"[rag] would delete {len(ids)} chunks from {src} "
+                f"(RAG_DELETE_MISSING_SOURCES=off)",
+                file=__import__("sys").stderr,
+            )
     return {"added": added, "updated": updated, "orphaned": orphaned}
 
 
@@ -442,11 +514,19 @@ _SIDECAR_PATH = os.environ.get(
 )
 
 
-def _log_query(query: str, chunks: list[str], k: int) -> None:
+def _log_query(
+    query: str,
+    chunks: list[str],
+    k: int,
+    *,
+    k_actual: int | None = None,
+    budget_tokens: int | None = None,
+    used_tokens: int | None = None,
+) -> None:
     """Append one line per query to a JSONL sidecar. Best-effort."""
     import json
     try:
-        record = {
+        record: dict = {
             "collection": collection_name(),
             "model": EMBEDDING_MODEL_ID,
             "dim": EMBEDDING_DIM,
@@ -454,6 +534,12 @@ def _log_query(query: str, chunks: list[str], k: int) -> None:
             "query": query,
             "num_results": len(chunks),
         }
+        if k_actual is not None:
+            record["k_actual"] = k_actual
+        if budget_tokens is not None:
+            record["budget_tokens"] = budget_tokens
+        if used_tokens is not None:
+            record["used_tokens"] = used_tokens
         with open(_SIDECAR_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
     except OSError:
@@ -467,6 +553,29 @@ SYSTEM_PROMPT = (
     "Cite sources inline as [source: filename] when you use a fact."
 )
 
+# Token budget for the context block. text-embedding-3-small is not used
+# here — this bounds the *chat completion* context, which is what the
+# model actually sees. Default 3000 leaves room for ~1500-token answers
+# and the system prompt within typical 8k-context free models.
+MAX_CONTEXT_TOKENS = int(os.environ.get("RAG_MAX_CONTEXT_TOKENS", "3000"))
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token count without a real tokenizer.
+
+    Heuristic: ~0.75 tokens per whitespace-separated word plus ~0.25 tokens
+    per character. Either term alone overshoots real BPE counts in opposite
+    directions; combining them tracks the OpenAI tiktoken cl100k_base within
+    ~15% for normal English prose. Good enough for a budget guard — we're
+    trying to avoid stuffing a 50k-char context block into a 4k-context
+    model, not to count exactly.
+    """
+    if not text:
+        return 0
+    word_term = int(len(text.split()) * 0.75)
+    char_term = int(len(text) * 0.25)
+    return max(word_term, char_term)
+
 
 def build_augmented_messages(query: str, k: int = 4) -> list[dict]:
     """Build a chat-completions messages list with retrieval context.
@@ -475,12 +584,58 @@ def build_augmented_messages(query: str, k: int = 4) -> list[dict]:
     turn contains [context chunks] + [the question]. We do NOT append
     this to the conversation's persistent messages — ask() uses it as a
     one-shot call so chat history stays clean.
+
+    Token budget: the context block is truncated to MAX_CONTEXT_TOKENS
+    (env RAG_MAX_CONTEXT_TOKENS, default 3000). When truncation kicks in,
+    the dropped tail is logged to stderr and the *actual* number of
+    chunks kept is recorded in the sidecar so a downstream dashboard can
+    spot queries that consistently need more context than the budget
+    allows.
     """
     chunks = retrieve(query, k=k)
-    _log_query(query, [t for t, _ in chunks], k)
 
     if not chunks:
+        _log_query(query, [t for t, _ in chunks], k)
         # nothing in the store — fall back to a plain chat-style message
+        return [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": (
+                f"Context: (no documents loaded)\n\n"
+                f"Question: {query}"
+            )},
+        ]
+
+    # Token-budget guard. Walk chunks in retrieval order, drop the tail
+    # once we'd exceed the budget. k_actual is what we actually kept.
+    kept: list[tuple[str, str]] = []
+    budget_tokens = 0
+    truncated = False
+    for text, source in chunks:
+        formatted = f"[{len(kept)+1}] [source: {source}] {text}"
+        chunk_tokens = _estimate_tokens(formatted) + 4  # +4 for separator overhead
+        if budget_tokens + chunk_tokens > MAX_CONTEXT_TOKENS:
+            print(
+                f"[rag] truncated context {k}->{len(kept)} "
+                f"({budget_tokens} tokens, budget {MAX_CONTEXT_TOKENS})",
+                file=__import__("sys").stderr,
+            )
+            truncated = True
+            break
+        kept.append((text, source))
+        budget_tokens += chunk_tokens
+
+    # Log after truncation so the sidecar carries the actual post-budget
+    # chunk count, not just the requested k.
+    _log_query(
+        query,
+        [t for t, _ in kept],
+        k,
+        k_actual=len(kept) if truncated else None,
+        budget_tokens=MAX_CONTEXT_TOKENS if truncated else None,
+        used_tokens=budget_tokens if truncated else None,
+    )
+
+    if not kept:
         return [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": (
@@ -491,7 +646,7 @@ def build_augmented_messages(query: str, k: int = 4) -> list[dict]:
 
     context_block = "\n\n---\n\n".join(
         f"[{i+1}] [source: {source}] {text}"
-        for i, (text, source) in enumerate(chunks)
+        for i, (text, source) in enumerate(kept)
     )
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
