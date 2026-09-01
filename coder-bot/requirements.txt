@@ -1,0 +1,8 @@
+openai>=1.40.0
+python-dotenv>=1.0.0
+SpeechRecognition>=3.10.0
+pyttsx3>=2.90
+pyaudio>=0.2.13
+PyAudio>=0.2.14
+# Optional, used by voice_utils only when STT engine is available
+# `faster-whisper` is a good offline alternative; not required.
